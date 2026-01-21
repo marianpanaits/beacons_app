@@ -34,14 +34,18 @@ class MainActivity: FlutterActivity() {
     private var mokoBleScanner: MokoBleScanner? = null
     private var eventSink: EventChannel.EventSink? = null
     private var isScanning = false
-    // MAC-based frame accumulation: last UID + last ACC per beacon
-    private val beaconFrames = mutableMapOf<String, MutableMap<String, Any?>>()
+    // Thread-safe beacon storage (like official SDK)
+    private val beaconXInfoHashMap = java.util.concurrent.ConcurrentHashMap<String, BeaconXInfo>()
+    private val beaconFrames = java.util.concurrent.ConcurrentHashMap<String, MutableMap<String, Any?>>()
     private var connectingMac: String? = null
     private val beaconPassword = "Moko4321"
-    private var gattReadAttempted = false
-    private var lockStateChallenge: ByteArray? = null
-    // Single parser instance to accumulate frames across scan results
-    private val beaconXInfoParser = BeaconXInfoParseableImpl()
+    // Parser instance - recreated each scan (like official SDK)
+    private var beaconXInfoParser: BeaconXInfoParseableImpl? = null
+    // Handler for periodic UI updates
+    private val handler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var updateRunnable: Runnable? = null
+    // Queue of beacons needing GATT read
+    private val gattQueue = java.util.concurrent.ConcurrentLinkedQueue<String>()
 
     override fun onCreate(savedInstanceState: android.os.Bundle?) {
         super.onCreate(savedInstanceState)
@@ -151,12 +155,19 @@ class MainActivity: FlutterActivity() {
     private fun startScan() {
         if (isScanning) return
         
+        // Clear previous data and create fresh parser (like official SDK)
+        beaconXInfoHashMap.clear()
+        beaconXInfoParser = BeaconXInfoParseableImpl()
+        
         // Use MokoBleScanner (Nordic library) for proper ScanResult type
         mokoBleScanner = MokoBleScanner(this)
         mokoBleScanner?.startScanDevice(object : MokoScanDeviceCallback {
             override fun onStartScan() {
                 isScanning = true
                 android.util.Log.d("BeaconX-SDK", "MokoBleScanner started")
+                
+                // Start periodic UI updates (every 500ms like official SDK)
+                startPeriodicUpdates()
             }
             
             override fun onScanDevice(deviceInfo: DeviceInfo) {
@@ -165,9 +176,53 @@ class MainActivity: FlutterActivity() {
             
             override fun onStopScan() {
                 isScanning = false
+                stopPeriodicUpdates()
                 android.util.Log.d("BeaconX-SDK", "MokoBleScanner stopped")
             }
         })
+    }
+    
+    private fun startPeriodicUpdates() {
+        updateRunnable = object : Runnable {
+            override fun run() {
+                if (isScanning) {
+                    // Send all beacons to Flutter
+                    sendAllBeaconsToFlutter()
+                    // Process GATT queue if not busy
+                    processGattQueue()
+                    // Schedule next update
+                    handler.postDelayed(this, 500)
+                }
+            }
+        }
+        handler.postDelayed(updateRunnable!!, 500)
+    }
+    
+    private fun stopPeriodicUpdates() {
+        updateRunnable?.let { handler.removeCallbacks(it) }
+        updateRunnable = null
+    }
+    
+    private fun sendAllBeaconsToFlutter() {
+        beaconFrames.forEach { (mac, frames) ->
+            eventSink?.success(frames.toMap())
+        }
+    }
+    
+    private fun processGattQueue() {
+        if (connectingMac != null) return // Already connecting
+        
+        val nextMac = gattQueue.poll() ?: return
+        val hasUid = beaconFrames[nextMac]?.containsKey("uid") == true
+        
+        if (!hasUid) {
+            android.util.Log.d("BeaconX-SDK", "[$nextMac] Processing GATT queue, connecting...")
+            connectingMac = nextMac
+            MokoSupport.getInstance().connDevice(nextMac)
+        } else {
+            // Already has UID, try next in queue
+            processGattQueue()
+        }
     }
     
     private fun processDeviceInfo(deviceInfo: DeviceInfo) {
@@ -176,25 +231,22 @@ class MainActivity: FlutterActivity() {
             val rssi = deviceInfo.rssi
             val name = deviceInfo.name ?: ""
             
-            // === BeaconX SDK 2-step parsing approach ===
-            // DeviceInfo already has scanResult from MokoBleScanner
-            // Use shared parser instance to accumulate frames across advertisements
-            
-            val beaconXInfo = beaconXInfoParser.parseDeviceInfo(deviceInfo)
+            // Parse using BeaconX SDK (like official app)
+            val beaconXInfo = beaconXInfoParser?.parseDeviceInfo(deviceInfo)
             if (beaconXInfo == null) {
                 // Not a BeaconX Pro device, skip
                 return
             }
             
-            android.util.Log.d("BeaconX-SDK", "[$mac] BeaconX Pro detected!")
+            // Store in hashmap (like official SDK)
+            beaconXInfoHashMap[mac] = beaconXInfo
             
-            // Auto-trigger GATT read for new BeaconX beacons to get namespace ID
+            // Queue for GATT read if doesn't have namespace yet (non-blocking)
             val existingFrames = beaconFrames[mac]
             val hasNamespace = existingFrames?.containsKey("uid") == true
-            if (!hasNamespace && connectingMac == null) {
-                android.util.Log.d("BeaconX-SDK", "[$mac] New BeaconX beacon, triggering GATT read for namespace...")
-                connectingMac = mac
-                MokoSupport.getInstance().connDevice(mac)
+            if (!hasNamespace && !gattQueue.contains(mac)) {
+                android.util.Log.d("BeaconX-SDK", "[$mac] BeaconX Pro detected, queued for GATT read")
+                gattQueue.offer(mac)
             }
             
             android.util.Log.d("BeaconX-SDK", "[$mac] Parsed BeaconXInfo, validDataHashMap size=${beaconXInfo.validDataHashMap?.size ?: 0}")
@@ -264,8 +316,7 @@ class MainActivity: FlutterActivity() {
                 }
             }
             
-            // Send accumulated frames to Flutter
-            eventSink?.success(frames.toMap())
+            // Note: Data is sent to Flutter periodically via sendAllBeaconsToFlutter()
         } catch (e: Exception) {
             android.util.Log.e("BeaconX-SDK", "Error processing scan result: ${e.message}")
             e.printStackTrace()
@@ -274,28 +325,11 @@ class MainActivity: FlutterActivity() {
 
     private fun stopScan() {
         if (!isScanning) return
+        stopPeriodicUpdates()
         mokoBleScanner?.stopScanDevice()
         mokoBleScanner = null
         isScanning = false
         android.util.Log.d("BeaconX-SDK", "MokoBleScanner stopped")
-    }
-    
-    private fun tryConnectNextBeacon() {
-        if (connectingMac != null) return
-        
-        // Find a beacon that doesn't have namespace yet
-        val beaconWithoutNamespace = beaconFrames.entries.firstOrNull { (_, frames) ->
-            !frames.containsKey("uid")
-        }
-        
-        if (beaconWithoutNamespace != null) {
-            val mac = beaconWithoutNamespace.key
-            android.util.Log.d("BeaconX-SDK", "[$mac] Found beacon without namespace, triggering GATT read...")
-            connectingMac = mac
-            MokoSupport.getInstance().connDevice(mac)
-        } else {
-            android.util.Log.d("BeaconX-SDK", "All beacons have namespace, no more GATT reads needed")
-        }
     }
 
     private fun triggerGattRead() {
@@ -320,11 +354,7 @@ class MainActivity: FlutterActivity() {
             "ACTION_DISCONNECTED" -> {
                 android.util.Log.d("BeaconX-GATT", "Disconnected")
                 connectingMac = null
-                
-                // Check if there are other beacons that need namespace reading
-                android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                    tryConnectNextBeacon()
-                }, 1000)
+                // processGattQueue will automatically pick up next beacon on periodic update
             }
         }
     }
