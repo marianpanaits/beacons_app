@@ -165,6 +165,12 @@ class MainActivity: FlutterActivity() {
         try {
             val device = result.device
             val mac = device.address
+            
+            // Filter: only process these 2 specific beacons
+            if (mac != "D7:4F:4C:D2:4F:3B" && mac != "ED:CF:19:48:B0:D5") {
+                return
+            }
+            
             val scanRecord = result.scanRecord ?: return
             val rawBytes = scanRecord.bytes ?: return
             val rssi = result.rssi
@@ -194,13 +200,8 @@ class MainActivity: FlutterActivity() {
                 logPos += 1 + length
             }
             
-            // Try GATT with alternative readable characteristics (once only)
-            if (mac == "D7:4F:4C:D2:4F:3B" && foundFEAB && !foundFEAA && beaconFrames[mac]?.containsKey("uid") != true && connectingMac == null && !gattReadAttempted) {
-                android.util.Log.d("BeaconX-GATT", "D7:4F:4C:D2:4F:3B has ACC but no UID - trying GATT read (once)...")
-                gattReadAttempted = true
-                connectingMac = mac
-                triggerGattRead()
-            }
+            // Log detected service UUIDs
+            android.util.Log.d("BeaconX-PURE", "[$mac] FEAA=$foundFEAA, FEAB=$foundFEAB")
             
             // Initialize frame cache for this MAC if needed
             if (!beaconFrames.containsKey(mac)) {
@@ -233,8 +234,9 @@ class MainActivity: FlutterActivity() {
                     
                     when (uuid16) {
                         0xFEAA -> {
-                            // Eddystone UID (frame type 0x00)
-                            if (payload.size >= 20 && payload[0].toInt() and 0xFF == 0x00) {
+                            android.util.Log.d("BeaconX-PURE", "[$mac] 📡 FEAA frame detected, payload size=${payload.size}, frameType=0x${payload.getOrNull(0)?.let { "%02x".format(it) }}")
+                            // Eddystone UID (frame type 0x00) - 18 bytes total
+                            if (payload.size >= 18 && payload[0].toInt() and 0xFF == 0x00) {
                                 val txPower = payload[1].toInt()
                                 val namespace = payload.sliceArray(2..11).joinToString("") { "%02X".format(it) }
                                 val instance = payload.sliceArray(12..17).joinToString("") { "%02X".format(it) }
@@ -346,46 +348,34 @@ class MainActivity: FlutterActivity() {
         
         when (response.orderCHAR) {
             OrderCHAR.CHAR_UNLOCK -> {
-                android.util.Log.d("BeaconX-GATT", "✅ Unlocked! Reading slot type via PARAMS notification protocol...")
-                // Manually create ParamsTask for GET_SLOT_TYPE (0x61)
-                // Format: EA + ParamsKey + 0000 → triggers notification on CHAR_LOCKED_NOTIFY
-                val slotTypeTask = com.moko.support.nordic.task.ParamsTask()
-                slotTypeTask.data = byteArrayOf(0xEA.toByte(), 0x61, 0x00, 0x00)
-                MokoSupport.getInstance().sendOrder(slotTypeTask)
+                android.util.Log.d("BeaconX-GATT", "✅ Unlocked! Reading Active Slot (a3c87502)...")
+                // READ Active Slot first (no assembler method exists, create task directly)
+                val getActiveSlotTask = com.moko.support.nordic.task.GetAdvSlotTask()
+                MokoSupport.getInstance().sendOrder(getActiveSlotTask)
             }
-            OrderCHAR.CHAR_PARAMS -> {
-                // MokoSupport routes notification responses here
+            OrderCHAR.CHAR_ADV_SLOT -> {
                 val data = response.responseValue ?: return
-                android.util.Log.d("BeaconX-GATT", "📡 PARAMS NOTIFICATION: ${data.joinToString("") { "%02x".format(it) }}")
+                android.util.Log.d("BeaconX-GATT", "📊 Active Slot (a3c87502): ${data.joinToString("") { "%02x".format(it) }}")
                 
-                if (data.size < 2) return
+                // Now READ ADV Slot Data (a3c8750a)
+                android.util.Log.d("BeaconX-GATT", "Reading ADV Slot Data (a3c8750a)...")
+                val getSlotDataTask = com.moko.support.nordic.OrderTaskAssembler.getSlotData()
+                MokoSupport.getInstance().sendOrder(getSlotDataTask)
+            }
+            OrderCHAR.CHAR_ADV_SLOT_DATA -> {
+                val data = response.responseValue ?: return
+                android.util.Log.d("BeaconX-GATT", "📊 ADV Slot Data (a3c8750a): ${data.joinToString("") { "%02x".format(it) }}")
                 
-                // Format: EB + ParamsKey + Length + Data
-                if (data[0].toInt() and 0xFF == 0xEB) {
-                    val paramsKey = data[1].toInt() and 0xFF
-                    val dataLen = if (data.size > 2) (data[2].toInt() and 0xFF) else 0
-                    android.util.Log.d("BeaconX-GATT", "ParamsKey: 0x${paramsKey.toString(16)}, Length: $dataLen")
-                    
-                    when (paramsKey) {
-                        0x0D -> { // Some response type
-                            android.util.Log.d("BeaconX-GATT", "Response 0x0D - unexpected, trying different approach")
-                            // Try reading device MAC to confirm PARAMS works
-                            val macTask = com.moko.support.nordic.task.ParamsTask()
-                            macTask.data = byteArrayOf(0xEA.toByte(), 0x20, 0x00, 0x00)
-                            MokoSupport.getInstance().sendOrder(macTask)
-                        }
-                        0x20 -> { // GET_DEVICE_MAC response
-                            val macData = if (data.size >= 9) data.sliceArray(4..9) else byteArrayOf()
-                            android.util.Log.d("BeaconX-GATT", "✅ Device MAC via PARAMS: ${macData.joinToString(":") { "%02X".format(it) }}")
-                            // PARAMS protocol confirmed working - now disconnect
-                            android.util.Log.d("BeaconX-GATT", "✅ PARAMS protocol works!")
-                            android.util.Log.d("BeaconX-GATT", "❌ GET_SLOT_TYPE returned unexpected 0x0D")
-                            android.util.Log.d("BeaconX-GATT", "CONCLUSION: Need to find correct PARAMS command for reading slot UID data")
-                            MokoSupport.getInstance().disConnectBle()
-                            connectingMac = null
-                        }
-                    }
-                }
+                // Parse UID from slot data
+                parseSlotData(mac, data)
+                
+                // Disconnect after successful read
+                android.util.Log.d("BeaconX-GATT", "✅ UID read complete. Disconnecting...")
+                MokoSupport.getInstance().disConnectBle()
+                connectingMac = null
+            }
+            else -> {
+                android.util.Log.d("BeaconX-GATT", "Unhandled characteristic: ${response.orderCHAR}")
             }
         }
     }

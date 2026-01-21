@@ -117,6 +117,7 @@ class _ScanScreenState extends State<ScanScreen> {
           debugPrint('🌡️ T&H: Temp=${frames.temperature}°C, Humidity=${frames.humidity}%');
         }
 
+        debugPrint('🔄 setState called. _scanResults.length=${_scanResults.length}, _beaconFrames.length=${_beaconFrames.length}');
         setState(() {});
       });
     } catch (e) {
