@@ -5,15 +5,19 @@ import 'package:encrypt/encrypt.dart' as encrypt;
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 
-void main() => runApp(const MyApp());
+// =============================================================================
+// App Entry Point
+// =============================================================================
 
-class MyApp extends StatelessWidget {
-  const MyApp({super.key});
+void main() => runApp(const BeaconApp());
+
+class BeaconApp extends StatelessWidget {
+  const BeaconApp({super.key});
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Beacon Scanner',
+      title: 'BeaconX Scanner',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.blue),
@@ -24,6 +28,10 @@ class MyApp extends StatelessWidget {
   }
 }
 
+// =============================================================================
+// Scan Screen
+// =============================================================================
+
 class ScanScreen extends StatefulWidget {
   const ScanScreen({super.key});
 
@@ -33,13 +41,14 @@ class ScanScreen extends StatefulWidget {
 
 class _ScanScreenState extends State<ScanScreen> {
   static const _targetNamespaceId = '60657774606074726163';
+  static const _beaconPassword = 'Moko4321';
 
   final Map<String, BeaconData> _beacons = {};
-  bool _isScanning = false;
   StreamSubscription? _scanSubscription;
   String? _connectingMac;
+  bool _isScanning = false;
 
-  List<String> get _filteredDevices =>
+  List<String> get _filteredMacs =>
       _beacons.entries.where((e) => e.value.namespaceId == _targetNamespaceId).map((e) => e.key).toList();
 
   @override
@@ -62,15 +71,13 @@ class _ScanScreenState extends State<ScanScreen> {
 
   void _startScan() {
     if (_isScanning) return;
-
     _scanSubscription?.cancel();
-    _scanSubscription = FlutterBluePlus.onScanResults.listen(_handleScanResults);
-
+    _scanSubscription = FlutterBluePlus.onScanResults.listen(_onScanResults);
     FlutterBluePlus.startScan(androidUsesFineLocation: true);
     setState(() => _isScanning = true);
   }
 
-  void _handleScanResults(List<ScanResult> results) {
+  void _onScanResults(List<ScanResult> results) {
     for (final result in results) {
       for (final entry in result.advertisementData.serviceData.entries) {
         final uuid = entry.key.str.toLowerCase();
@@ -87,7 +94,7 @@ class _ScanScreenState extends State<ScanScreen> {
 
         if (uuid.contains('feab')) {
           _parseBeaconXFrame(beacon, data);
-        } else if (uuid.contains('feaa')) {
+        } else {
           _parseEddystoneFrame(beacon, data);
         }
 
@@ -99,103 +106,105 @@ class _ScanScreenState extends State<ScanScreen> {
     setState(() {});
   }
 
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('BeaconX Scanner'),
+        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
+      ),
+      body: Column(
+        children: [
+          if (_isScanning) const LinearProgressIndicator(),
+          Expanded(
+            child: _filteredMacs.isEmpty
+                ? const Center(child: Text('Scanning for beacons...'))
+                : ListView.builder(
+                    itemCount: _filteredMacs.length,
+                    itemBuilder: (_, i) => BeaconCard(
+                      beacon: _beacons[_filteredMacs[i]]!,
+                    ),
+                  ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// =============================================================================
+// Frame Parsing (extension on _ScanScreenState)
+// =============================================================================
+
+extension _FrameParsing on _ScanScreenState {
   void _parseBeaconXFrame(BeaconData beacon, Uint8List data) {
-    if (data.isEmpty) return;
-    final frameType = data[0];
+    if (data.isEmpty || data[0] != 0x60 || data.length < 14) return;
 
-    if (frameType == 0x60 && data.length >= 14) {
-      // Get scale from byte 4 (like native SDK)
-      final scaleIndex = data[4];
-      final scale = scaleIndex == 3 ? 12.0 : (1 << scaleIndex).toDouble(); // 1, 2, 4, or 12
+    final scaleIndex = data[4];
+    final scale = scaleIndex == 3 ? 12.0 : (1 << scaleIndex).toDouble();
 
-      // Parse X, Y, Z (bytes 6-11) - right shift by 4 like native SDK
-      final xRaw = _toSigned16((data[6] << 8) | data[7]) >> 4;
-      final yRaw = _toSigned16((data[8] << 8) | data[9]) >> 4;
-      final zRaw = _toSigned16((data[10] << 8) | data[11]) >> 4;
-
-      // Convert to mg using scale factor
-      beacon.accelX = (xRaw * scale).roundToDouble();
-      beacon.accelY = (yRaw * scale).roundToDouble();
-      beacon.accelZ = (zRaw * scale).roundToDouble();
-      beacon.batteryVoltage = (data[12] << 8) | data[13];
-    }
+    beacon
+      ..accelX = (_toSigned16((data[6] << 8) | data[7]) >> 4) * scale
+      ..accelY = (_toSigned16((data[8] << 8) | data[9]) >> 4) * scale
+      ..accelZ = (_toSigned16((data[10] << 8) | data[11]) >> 4) * scale
+      ..batteryVoltage = (data[12] << 8) | data[13];
   }
 
   void _parseEddystoneFrame(BeaconData beacon, Uint8List data) {
     if (data.isEmpty) return;
-    final frameType = data[0];
 
-    if (frameType == 0x00 && data.length >= 18) {
-      beacon.namespaceId = _toHex(data.sublist(2, 12));
-      beacon.instanceId = _toHex(data.sublist(12, 18));
+    if (data[0] == 0x00 && data.length >= 18) {
+      beacon
+        ..namespaceId = _toHex(data.sublist(2, 12))
+        ..instanceId = _toHex(data.sublist(12, 18));
     }
 
-    if (frameType == 0x20 && data.length >= 14) {
-      beacon.batteryVoltage = (data[2] << 8) | data[3];
-      beacon.temperature = _toSigned16((data[4] << 8) | data[5]) / 256.0;
+    if (data[0] == 0x20 && data.length >= 14) {
+      beacon
+        ..batteryVoltage = (data[2] << 8) | data[3]
+        ..temperature = _toSigned16((data[4] << 8) | data[5]) / 256.0;
     }
   }
 
   int _toSigned16(int val) => val > 32767 ? val - 65536 : val;
-  String _toHex(List<int> bytes) => bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+  String _toHex(List<int> b) => b.map((x) => x.toRadixString(16).padLeft(2, '0')).join();
+}
 
+// =============================================================================
+// GATT Operations (extension on _ScanScreenState)
+// =============================================================================
+
+extension _GattOperations on _ScanScreenState {
   Future<void> _readNamespaceViaGatt(BluetoothDevice device, BeaconData beacon) async {
     _connectingMac = beacon.mac;
-    const password = 'Moko4321';
 
     try {
       await device.connect(timeout: const Duration(seconds: 10), license: License.commercial, autoConnect: false);
       final services = await device.discoverServices();
 
-      BluetoothCharacteristic? unlockChar;
-      BluetoothCharacteristic? lockStateChar;
-      BluetoothCharacteristic? slotDataChar;
+      final chars = _findCharacteristics(services);
+      if (chars == null) return;
 
-      // Find characteristics in BeaconX service
-      for (final service in services) {
-        for (final char in service.characteristics) {
-          final uuid = char.uuid.str.toLowerCase();
-          if (uuid.contains('a3c87507')) unlockChar = char; // CHAR_UNLOCK
-          if (uuid.contains('a3c87506')) lockStateChar = char; // CHAR_LOCK_STATE
-          if (uuid.contains('a3c8750a')) slotDataChar = char; // CHAR_ADV_SLOT_DATA
-        }
-      }
+      final (unlockChar, lockStateChar, slotDataChar) = chars;
 
-      if (unlockChar == null || lockStateChar == null || slotDataChar == null) return;
-
-      // Step 1: Read challenge from CHAR_UNLOCK (16 bytes)
+      // Read challenge & unlock
       final challenge = await unlockChar.read();
       if (challenge.length < 16) return;
 
-      // Step 2: Create AES key from password (padded to 16 bytes with 0xFF like native SDK)
-      final passwordBytes = Uint8List(16);
-      final pwCodeUnits = password.codeUnits;
-      for (int i = 0; i < 16; i++) {
-        passwordBytes[i] = i < pwCodeUnits.length ? pwCodeUnits[i] : 0xFF;
-      }
-
-      // Step 3: Encrypt challenge with AES-128-ECB
-      final key = encrypt.Key(passwordBytes);
-      final encrypter = encrypt.Encrypter(encrypt.AES(key, mode: encrypt.AESMode.ecb, padding: null));
-      final challengeBytes = Uint8List.fromList(challenge.take(16).toList());
-      final encrypted = encrypter.encryptBytes(challengeBytes);
-
-      // Step 4: Write encrypted data to CHAR_UNLOCK
-      await unlockChar.write(encrypted.bytes, withoutResponse: false);
+      final encrypted = _encryptChallenge(challenge);
+      await unlockChar.write(encrypted, withoutResponse: false);
       await Future.delayed(const Duration(milliseconds: 300));
 
-      // Step 5: Read lock state to verify unlock (0x00 = locked, 0x01+ = unlocked)
+      // Verify unlock
       final lockState = await lockStateChar.read();
-      if (lockState.isEmpty || lockState[0] == 0) {
-        // 0x00 means still locked - password incorrect
-        return;
-      }
+      if (lockState.isEmpty || lockState[0] == 0) return;
 
-      // Step 6: Read slot data (now unlocked)
+      // Read namespace
       final data = await slotDataChar.read();
       if (data.isNotEmpty && data[0] == 0x00 && data.length >= 18) {
-        beacon.namespaceId = _toHex(data.sublist(2, 12));
-        beacon.instanceId = _toHex(data.sublist(12, 18));
+        beacon
+          ..namespaceId = _toHex(data.sublist(2, 12))
+          ..instanceId = _toHex(data.sublist(12, 18));
         setState(() {});
       }
     } catch (_) {
@@ -207,95 +216,96 @@ class _ScanScreenState extends State<ScanScreen> {
     }
   }
 
-  int _batteryPercentage(int? voltage) {
-    if (voltage == null) return 0;
-    return ((voltage - 2800) / 1400 * 100).round().clamp(0, 100);
+  (BluetoothCharacteristic, BluetoothCharacteristic, BluetoothCharacteristic)? _findCharacteristics(
+    List<BluetoothService> services,
+  ) {
+    BluetoothCharacteristic? unlock, lockState, slotData;
+
+    for (final service in services) {
+      for (final char in service.characteristics) {
+        final uuid = char.uuid.str.toLowerCase();
+        if (uuid.contains('a3c87507')) unlock = char;
+        if (uuid.contains('a3c87506')) lockState = char;
+        if (uuid.contains('a3c8750a')) slotData = char;
+      }
+    }
+
+    if (unlock == null || lockState == null || slotData == null) return null;
+    return (unlock, lockState, slotData);
   }
 
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Beacon Scanner'),
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-      ),
-      body: Column(
-        children: [
-          if (_isScanning) const LinearProgressIndicator(),
-          Expanded(
-            child: _filteredDevices.isEmpty
-                ? const Center(child: Text('Scanning for beacons...'))
-                : ListView.builder(
-                    itemCount: _filteredDevices.length,
-                    itemBuilder: (context, index) {
-                      final mac = _filteredDevices[index];
-                      final beacon = _beacons[mac]!;
-                      return _BeaconCard(beacon: beacon, batteryPercentage: _batteryPercentage);
-                    },
-                  ),
-          ),
-        ],
-      ),
-    );
+  List<int> _encryptChallenge(List<int> challenge) {
+    final passwordBytes = Uint8List(16);
+    final pw = _ScanScreenState._beaconPassword.codeUnits;
+    for (int i = 0; i < 16; i++) {
+      passwordBytes[i] = i < pw.length ? pw[i] : 0xFF;
+    }
+
+    final key = encrypt.Key(passwordBytes);
+    final encrypter = encrypt.Encrypter(encrypt.AES(key, mode: encrypt.AESMode.ecb, padding: null));
+    return encrypter.encryptBytes(Uint8List.fromList(challenge.take(16).toList())).bytes;
   }
+
+  String _toHex(List<int> b) => b.map((x) => x.toRadixString(16).padLeft(2, '0')).join();
 }
 
-class _BeaconCard extends StatelessWidget {
-  final BeaconData beacon;
-  final int Function(int?) batteryPercentage;
+// =============================================================================
+// Beacon Card Widget
+// =============================================================================
 
-  const _BeaconCard({required this.beacon, required this.batteryPercentage});
+class BeaconCard extends StatelessWidget {
+  final BeaconData beacon;
+
+  const BeaconCard({super.key, required this.beacon});
+
+  int _batteryPercent(int? mV) => mV == null ? 0 : ((mV - 2800) / 1400 * 100).round().clamp(0, 100);
+
+  String _timeAgo(DateTime? t) {
+    if (t == null) return 'N/A';
+    final s = DateTime.now().difference(t).inSeconds;
+    return s < 60 ? '${s}s ago' : '${s ~/ 60}m ago';
+  }
 
   @override
   Widget build(BuildContext context) {
     return Card(
       margin: const EdgeInsets.all(8),
       child: ExpansionTile(
-        leading: Icon(
-          Icons.bluetooth,
-          color: beacon.rssi > -70 ? Colors.green : Colors.orange,
-        ),
-        title: Text(
-          beacon.name.isEmpty ? 'BeaconX Pro' : beacon.name,
-          style: const TextStyle(fontWeight: FontWeight.bold),
-        ),
+        leading: Icon(Icons.bluetooth, color: beacon.rssi > -70 ? Colors.green : Colors.orange),
+        title: Text(beacon.name.isEmpty ? 'BeaconX Pro' : beacon.name,
+            style: const TextStyle(fontWeight: FontWeight.bold)),
         subtitle: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Text('MAC: ${beacon.mac}', style: const TextStyle(fontSize: 11)),
             Text('RSSI: ${beacon.rssi} dBm', style: const TextStyle(fontSize: 11)),
             if (beacon.batteryVoltage != null)
-              Text(
-                'Battery: ${batteryPercentage(beacon.batteryVoltage)}% (${beacon.batteryVoltage} mV)',
-                style: const TextStyle(fontSize: 11),
-              ),
+              Text('Battery: ${_batteryPercent(beacon.batteryVoltage)}% (${beacon.batteryVoltage} mV)',
+                  style: const TextStyle(fontSize: 11)),
           ],
         ),
         children: [
           Padding(
-            padding: const EdgeInsets.all(16.0),
+            padding: const EdgeInsets.all(16),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 if (beacon.namespaceId != null) ...[
                   const Text('UID', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
                   const SizedBox(height: 8),
-                  _InfoRow(label: 'Namespace ID', value: '0x${beacon.namespaceId}'),
-                  _InfoRow(label: 'Instance ID', value: '0x${beacon.instanceId ?? "N/A"}'),
+                  _Row('Namespace', '0x${beacon.namespaceId}'),
+                  _Row('Instance', '0x${beacon.instanceId ?? "N/A"}'),
                   const Divider(),
                 ],
                 if (beacon.accelX != null) ...[
                   const Text('Accelerometer', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
                   const SizedBox(height: 8),
-                  _InfoRow(
-                    label: 'Acceleration',
-                    value:
-                        'X:${beacon.accelX?.toStringAsFixed(0)} Y:${beacon.accelY?.toStringAsFixed(0)} Z:${beacon.accelZ?.toStringAsFixed(0)} mg',
-                  ),
+                  _Row('Acceleration',
+                      'X:${beacon.accelX?.round()} Y:${beacon.accelY?.round()} Z:${beacon.accelZ?.round()} mg'),
                   const Divider(),
                 ],
-                _InfoRow(label: 'RSSI', value: '${beacon.rssi} dBm'),
-                _InfoRow(label: 'Last seen', value: _formatTime(beacon.lastSeen)),
+                _Row('RSSI', '${beacon.rssi} dBm'),
+                _Row('Last seen', _timeAgo(beacon.lastSeen)),
               ],
             ),
           ),
@@ -303,14 +313,27 @@ class _BeaconCard extends StatelessWidget {
       ),
     );
   }
+}
 
-  String _formatTime(DateTime? time) {
-    if (time == null) return 'N/A';
-    final diff = DateTime.now().difference(time);
-    if (diff.inSeconds < 60) return '${diff.inSeconds}s ago';
-    return '${diff.inMinutes}m ago';
+class _Row extends StatelessWidget {
+  final String label, value;
+  const _Row(this.label, this.value);
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(children: [
+        Expanded(flex: 2, child: Text(label, style: const TextStyle(color: Colors.grey, fontSize: 12))),
+        Expanded(flex: 3, child: Text(value, style: const TextStyle(fontSize: 12, fontFamily: 'monospace'))),
+      ]),
+    );
   }
 }
+
+// =============================================================================
+// Data Model
+// =============================================================================
 
 class BeaconData {
   final String mac;
@@ -320,39 +343,9 @@ class BeaconData {
 
   String? namespaceId;
   String? instanceId;
-
   int? batteryVoltage;
   double? temperature;
-
-  double? accelX;
-  double? accelY;
-  double? accelZ;
+  double? accelX, accelY, accelZ;
 
   BeaconData(this.mac);
-}
-
-class _InfoRow extends StatelessWidget {
-  final String label;
-  final String value;
-
-  const _InfoRow({required this.label, required this.value});
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 4.0),
-      child: Row(
-        children: [
-          Expanded(
-            flex: 2,
-            child: Text(label, style: const TextStyle(color: Colors.grey, fontSize: 12)),
-          ),
-          Expanded(
-            flex: 3,
-            child: Text(value, style: const TextStyle(fontSize: 12, fontFamily: 'monospace')),
-          ),
-        ],
-      ),
-    );
-  }
 }
