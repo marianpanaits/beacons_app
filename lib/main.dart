@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
@@ -31,12 +32,21 @@ class ScanScreen extends StatefulWidget {
 }
 
 class _ScanScreenState extends State<ScanScreen> {
-  static const String _beaconServiceUuid = 'feab';
+  // FEAA = Eddystone service
+  static const String _eddystone16 = 'feaa';
+  // FEAB = BeaconX custom service (as you mentioned)
+  static const String _beaconx16 = 'feab';
 
   List<ScanResult> _scanResults = [];
   final Map<String, BeaconFrames> _beaconFrames = {};
   bool _isScanning = false;
   StreamSubscription<List<ScanResult>>? _scanSubscription;
+
+  // GATT UUIDs (from BeaconX protocol)
+  static final Guid _serviceUuid = Guid('a3c87500-8ed3-4bdf-8a39-a01bebede295');
+  static final Guid _unlockCharUuid = Guid('a3c87507-8ed3-4bdf-8a39-a01bebede295');
+  static final Guid _advSlotDataCharUuid = Guid('a3c8750a-8ed3-4bdf-8a39-a01bebede295');
+  static const String _beaconPassword = 'Moko4321';
 
   @override
   void initState() {
@@ -53,106 +63,159 @@ class _ScanScreenState extends State<ScanScreen> {
   }
 
   Future<void> _initBluetooth() async {
+    // Android 12+ needs these
     await Permission.bluetoothScan.request();
     await Permission.bluetoothConnect.request();
+    // Still needed on many devices for scan results
     await Permission.location.request();
+
     _startScan();
   }
 
   Future<void> _startScan() async {
     if (_isScanning) return;
+
     setState(() => _isScanning = true);
 
     try {
-      await FlutterBluePlus.startScan();
+      // Optional: you can filter to reduce noise.
+      // Caveat: some beacons advertise FEAB only and might not match FEAA filter.
+      // So we include both services here.
+      await FlutterBluePlus.startScan(
+        androidUsesFineLocation: true,
+        continuousUpdates: true,
+      );
+
       _scanSubscription = FlutterBluePlus.scanResults.listen((results) {
+        final filtered = <ScanResult>[];
+
         for (final result in results) {
-          if (_isBeacon(result)) {
-            final deviceId = result.device.remoteId.toString();
-            _beaconFrames[deviceId] ??= BeaconFrames(deviceId);
+          if (!_isBeacon(result)) continue;
 
-            final ad = result.advertisementData;
+          final deviceId = result.device.remoteId.toString();
+          final isNewBeacon = !_beaconFrames.containsKey(deviceId);
+          _beaconFrames.putIfAbsent(deviceId, () => BeaconFrames(deviceId));
 
-            debugPrint('--- ${result.device.remoteId} RSSI=${result.rssi}');
-            debugPrint('serviceUuids: ${ad.serviceUuids.map((g) => g.str).toList()}');
-            debugPrint('serviceData keys: ${ad.serviceData.keys.map((g) => g.str).toList()}');
-            debugPrint('manufacturerData keys: ${ad.manufacturerData.keys.toList()}');
+          final frames = _beaconFrames[deviceId]!;
+          frames.rssi = result.rssi;
+          frames.lastSeen = DateTime.now();
 
-            for (final entry in result.advertisementData.serviceData.entries) {
-              if (entry.key.toString().toLowerCase().contains(_beaconServiceUuid)) {
-                _parseFrame(deviceId, entry.value, result.rssi);
-              }
+          // Automatically try to read UID via GATT for new beacons
+          if (isNewBeacon && !frames.hasReadGattData && !frames.isConnecting) {
+            _tryReadUidViaGatt(result.device);
+          }
+
+          final ad = result.advertisementData;
+
+          debugPrint('--- $deviceId RSSI=${result.rssi}');
+          debugPrint('serviceUuids: ${ad.serviceUuids.map((g) => g.str).toList()}');
+          debugPrint('serviceData keys: ${ad.serviceData.keys.map((g) => g.str).toList()}');
+          debugPrint('manufacturerData keys: ${ad.manufacturerData.keys.toList()}');
+
+          // Parse FEAA/FEAB serviceData
+          for (final entry in ad.serviceData.entries) {
+            final isFeaa = _matches16Or128(entry.key, 'feaa');
+            final isFeab = _matches16Or128(entry.key, 'feab');
+
+            if (isFeaa || isFeab) {
+              _parseFrame(deviceId, entry.value, result.rssi, service: isFeaa ? _eddystone16 : _beaconx16);
             }
           }
+
+          filtered.add(result);
         }
-        setState(() => _scanResults = results.where(_isBeacon).toList());
+
+        setState(() => _scanResults = filtered);
       });
     } catch (e) {
       debugPrint('Scan error: $e');
+      setState(() => _isScanning = false);
     }
   }
 
-  void _parseFrame(String deviceId, List<int> data, int rssi) {
+  // Robust UUID matching that handles both 16-bit and 128-bit formats
+  bool _matches16Or128(Guid g, String short16) {
+    final s = g.str.toLowerCase();
+    final t = short16.toLowerCase();
+    return s == t || s.endsWith('0000$t-0000-1000-8000-00805f9b34fb');
+  }
+
+  void _parseFrame(
+    String deviceId,
+    List<int> data,
+    int rssi, {
+    required String service,
+  }) {
     if (data.isEmpty) return;
+
     final frames = _beaconFrames[deviceId]!;
     frames.rssi = rssi;
     frames.lastSeen = DateTime.now();
 
-    // Debug logging
-    debugPrint('📊 Frame type: 0x${data[0].toRadixString(16).padLeft(2, '0')}');
-    debugPrint('📊 Raw data (${data.length} bytes): ${data.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ')}');
+    debugPrint('📦 Service=$service  FrameType=0x${data[0].toRadixString(16).padLeft(2, '0')}');
+    debugPrint('📊 Raw (${data.length} bytes): ${_hexSpaced(data)}');
 
     switch (data[0]) {
-      case 0x00: // UID
+      case 0x00: // Eddystone UID
+        // FEAA service data layout:
+        // 0: frame type (0x00)
+        // 1: tx power
+        // 2..11: namespace (10 bytes)
+        // 12..17: instance (6 bytes)
         if (data.length >= 18) {
-          frames.namespaceId = data.sublist(2, 12).map((b) => b.toRadixString(16).padLeft(2, '0')).join('');
-          frames.instanceId = data.sublist(12, 18).map((b) => b.toRadixString(16).padLeft(2, '0')).join('');
+          frames.namespaceId = _hexCompact(data.sublist(2, 12));
+          frames.instanceId = _hexCompact(data.sublist(12, 18));
         }
         break;
-      case 0x20: // TLM
+
+      case 0x20: // Eddystone TLM (unencrypted)
+        // FEAA service data layout:
+        // 0: frame type (0x20)
+        // 1: version
+        // 2..3: battery voltage (mV)
+        // 4..5: temperature (signed 8.8 fixed point); 0x8000 = not supported
+        // 6..9: adv count (uint32)
+        // 10..13: time since boot in 0.1s (uint32)
         if (data.length >= 14) {
           frames.batteryVoltage = (data[2] << 8) | data[3];
-          final tempInt = (data[4] << 16) | (data[5] << 8);
-          frames.temperature = tempInt.toSigned(24) / 256.0;
+
+          final t0 = data[4];
+          final t1 = data[5];
+          final tempRaw = (t0 << 8) | t1;
+          if (tempRaw == 0x8000) {
+            frames.temperature = null;
+          } else {
+            final signedInt8 = (t0 & 0x80) != 0 ? t0 - 256 : t0;
+            frames.temperature = signedInt8 + (t1 / 256.0);
+          }
+
           frames.advCount = (data[6] << 24) | (data[7] << 16) | (data[8] << 8) | data[9];
-          frames.runningTime = (data[10] << 24) | (data[11] << 16) | (data[12] << 8) | data[13];
+          frames.runningTime01s = (data[10] << 24) | (data[11] << 16) | (data[12] << 8) | data[13]; // 0.1s units
         }
         break;
-      case 0x60: // Accelerometer (BeaconX custom frame)
-        if (data.length >= 21) {
-          // Per BeaconX doc Table 9: Customized-3-axis ACC advertisement
-          // Byte 1: Ranging data (Tx power at specific distance)
-          // Byte 2: Adv interval (unit: 100ms/digit)
-          // Byte 3: Sampling rate (0x01=10Hz, 0x02=25Hz, etc.)
-          // Byte 4: Full-scale (0x00=±2g, 0x01=±4g, etc.)
-          // Byte 5: Motion threshold (unit: 0.1g/digit)
-          // Bytes 6-7: X-axis raw data
-          // Bytes 8-9: Y-axis raw data
-          // Bytes 10-11: Z-axis raw data
-          // Bytes 12-13: Battery voltage
-          // Byte 14: RFU (Reserved)
-          // Bytes 15-20: MAC address
 
+      case 0x60: // BeaconX custom 3-axis ACC frame (as you described)
+        // Your parsing is kept, plus both MAC endian views for sanity.
+        if (data.length >= 21) {
           frames.rangingData = data[1].toSigned(8);
-          frames.advInterval = data[2] * 100; // Convert to milliseconds
+          frames.advInterval = data[2] * 100; // ms
           frames.samplingRate = data[3];
           frames.fullScale = data[4];
-          frames.motionThreshold = data[5] * 0.1; // Convert to g
+          frames.motionThreshold = data[5] * 0.1;
 
           final xRaw = (data[6] << 8) | data[7];
           final yRaw = (data[8] << 8) | data[9];
           final zRaw = (data[10] << 8) | data[11];
+
           frames.batteryVoltage = (data[12] << 8) | data[13];
 
           frames.accelX = _decode12BitSignedMg(xRaw);
           frames.accelY = _decode12BitSignedMg(yRaw);
           frames.accelZ = _decode12BitSignedMg(zRaw);
 
-          // Parse MAC address (bytes 15-20)
-          if (data.length >= 21) {
-            frames.beaconMac =
-                data.sublist(15, 21).map((b) => b.toRadixString(16).padLeft(2, '0').toUpperCase()).join(':');
-          }
+          final macBytes = Uint8List.fromList(data.sublist(15, 21));
+          frames.beaconMac = _hexMac(macBytes);
+          frames.beaconMacReversed = _hexMac(Uint8List.fromList(macBytes.reversed.toList()));
 
           debugPrint(
               '🔋 Battery: ${frames.batteryVoltage} mV (${_calculateBatteryPercentage(frames.batteryVoltage)}%)');
@@ -160,13 +223,22 @@ class _ScanScreenState extends State<ScanScreen> {
           debugPrint(
               '⚙️ Ranging: ${frames.rangingData} dBm, Interval: ${frames.advInterval} ms, Rate: ${_getSamplingRateHz(frames.samplingRate)} Hz');
           debugPrint('📏 Full-scale: ${_getFullScaleG(frames.fullScale)}g, Threshold: ${frames.motionThreshold}g');
-          debugPrint('📍 Beacon MAC: ${frames.beaconMac}');
+          debugPrint('📍 Beacon MAC: ${frames.beaconMac}  (rev: ${frames.beaconMacReversed})');
         }
         break;
+
       default:
-        debugPrint('data[0]:: ${data[0]}');
+        // If you see other frame types, we can add them (0x10 URL, etc.)
+        debugPrint('🤷 Unhandled frame type: 0x${data[0].toRadixString(16)}');
+        break;
     }
   }
+
+  String _hexSpaced(List<int> bytes) => bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ');
+
+  String _hexCompact(List<int> bytes) => bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+
+  String _hexMac(Uint8List bytes) => bytes.map((b) => b.toRadixString(16).padLeft(2, '0').toUpperCase()).join(':');
 
   double _decode12BitSignedMg(int raw16) {
     final v12 = (raw16 >> 4) & 0x0FFF;
@@ -176,16 +248,14 @@ class _ScanScreenState extends State<ScanScreen> {
 
   int _calculateBatteryPercentage(int? voltage) {
     if (voltage == null) return 0;
-    // Li-ion battery: 4200mV=100%, 2800mV=0% (realistic discharge curve)
     const minVoltage = 2800;
     const maxVoltage = 4200;
-    int percentage = ((voltage - minVoltage) / (maxVoltage - minVoltage) * 100).round();
+    final percentage = ((voltage - minVoltage) / (maxVoltage - minVoltage) * 100).round();
     return percentage.clamp(0, 100);
   }
 
   String _getSamplingRateHz(int? code) {
     if (code == null) return 'N/A';
-    // Per BeaconX Table 13: Sampling rate comparison table
     switch (code) {
       case 0x00:
         return '1';
@@ -204,7 +274,6 @@ class _ScanScreenState extends State<ScanScreen> {
 
   String _getFullScaleG(int? code) {
     if (code == null) return 'N/A';
-    // Per BeaconX Table 14: Full-scale comparison table
     switch (code) {
       case 0x00:
         return '±2';
@@ -215,14 +284,111 @@ class _ScanScreenState extends State<ScanScreen> {
       case 0x03:
         return '±16';
       default:
-        return '±${code}';
+        return '±$code';
     }
   }
 
   bool _isBeacon(ScanResult result) {
-    // Filter to show only target beacons
+    // Your original filter
     final mac = result.device.remoteId.toString().toUpperCase();
     return mac == 'D7:4F:4C:D2:4F:3B' || mac == 'ED:CF:19:48:B0:D5';
+  }
+
+  Future<void> _tryReadUidViaGatt(BluetoothDevice device) async {
+    final deviceId = device.remoteId.toString();
+    final frames = _beaconFrames[deviceId];
+    if (frames == null) return;
+
+    if (frames.isConnecting) {
+      debugPrint('⏳ Already connecting to $deviceId');
+      return;
+    }
+
+    try {
+      setState(() => frames.isConnecting = true);
+      debugPrint('🔗 Connecting to $deviceId for UID read...');
+
+      await device.connect(timeout: const Duration(seconds: 15), license: License.commercial);
+      debugPrint('✅ Connected to $deviceId');
+
+      final services = await device.discoverServices();
+      debugPrint('🔍 Services discovered: ${services.length} services');
+      
+      // Log all services and characteristics
+      for (final service in services) {
+        debugPrint('  📋 Service: ${service.uuid}');
+        for (final char in service.characteristics) {
+          debugPrint('    📌 Char: ${char.uuid} (${char.properties})');
+        }
+      }
+
+      final service = services.firstWhere(
+        (s) => s.uuid == _serviceUuid,
+        orElse: () => throw Exception('BeaconX service not found'),
+      );
+      
+      final unlockChar = service.characteristics.firstWhere(
+        (c) => c.uuid == _unlockCharUuid,
+        orElse: () => throw Exception('Unlock characteristic not found'),
+      );
+      final slotDataChar = service.characteristics.firstWhere(
+        (c) => c.uuid == _advSlotDataCharUuid,
+        orElse: () => throw Exception('Slot data characteristic not found'),
+      );
+
+      // Unlock beacon with password
+      debugPrint('🔓 Unlocking with password...');
+      final passwordBytes = _beaconPassword.codeUnits;
+      final unlockData = List<int>.filled(16, 0xFF);
+      for (int i = 0; i < passwordBytes.length && i < 16; i++) {
+        unlockData[i] = passwordBytes[i];
+      }
+      await unlockChar.write(unlockData, withoutResponse: false);
+      
+      // Wait and verify unlock by reading unlock characteristic
+      await Future.delayed(const Duration(milliseconds: 1000));
+      final unlockStatus = await unlockChar.read();
+      debugPrint('🔐 Unlock status: ${unlockStatus.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ')}');
+      debugPrint('✅ Unlocked');
+
+      // Read ADV Slot Data
+      debugPrint('📖 Reading ADV Slot Data...');
+      final slotData = await slotDataChar.read();
+      debugPrint('📊 Slot data: ${slotData.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ')}');
+
+      // Parse UID from slot data
+      if (slotData.isNotEmpty && slotData[0] == 0x00 && slotData.length >= 18) {
+        final namespace =
+            slotData.sublist(2, 12).map((b) => b.toRadixString(16).padLeft(2, '0')).join('').toUpperCase();
+        final instance =
+            slotData.sublist(12, 18).map((b) => b.toRadixString(16).padLeft(2, '0')).join('').toUpperCase();
+
+        debugPrint('✅ UID via GATT: namespace=$namespace, instance=$instance');
+
+        setState(() {
+          frames.namespaceId = namespace;
+          frames.instanceId = instance;
+          frames.hasReadGattData = true;
+        });
+      } else {
+        debugPrint('⚠️ Slot data frame type: 0x${slotData.isNotEmpty ? slotData[0].toRadixString(16) : 'empty'}');
+        debugPrint('ℹ️ This slot may not contain UID data');
+      }
+
+      await device.disconnect();
+      debugPrint('🔌 Disconnected from $deviceId');
+    } catch (e, stackTrace) {
+      debugPrint('❌ GATT error for $deviceId: $e');
+      debugPrint('Stack trace: $stackTrace');
+      try {
+        await device.disconnect();
+      } catch (disconnectError) {
+        debugPrint('⚠️ Disconnect error: $disconnectError');
+      }
+    } finally {
+      debugPrint('🏁 GATT operation finished for $deviceId');
+      setState(() => frames.isConnecting = false);
+    }
   }
 
   @override
@@ -263,8 +429,9 @@ class _ScanScreenState extends State<ScanScreen> {
                               Text('RSSI: ${result.rssi} dBm', style: const TextStyle(fontSize: 11)),
                               if (frames?.batteryVoltage != null)
                                 Text(
-                                    'Battery: ${_calculateBatteryPercentage(frames!.batteryVoltage)}% (${frames.batteryVoltage} mV)',
-                                    style: const TextStyle(fontSize: 11)),
+                                  'Battery: ${_calculateBatteryPercentage(frames!.batteryVoltage)}% (${frames.batteryVoltage} mV)',
+                                  style: const TextStyle(fontSize: 11),
+                                ),
                             ],
                           ),
                           children: [
@@ -274,53 +441,68 @@ class _ScanScreenState extends State<ScanScreen> {
                                 crossAxisAlignment: CrossAxisAlignment.start,
                                 children: [
                                   if (frames?.namespaceId != null) ...[
-                                    const Text('UID', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                                    const Text('Eddystone UID',
+                                        style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
                                     const SizedBox(height: 8),
                                     _InfoRow(label: 'Namespace ID', value: '0x${frames!.namespaceId}'),
                                     _InfoRow(label: 'Instance ID', value: '0x${frames.instanceId ?? "N/A"}'),
                                     const Divider(),
                                   ],
-                                  if (frames?.temperature != null) ...[
-                                    const Text('Unencrypted TLM',
+                                  if (frames?.temperature != null || frames?.advCount != null) ...[
+                                    const Text('Eddystone TLM',
                                         style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
                                     const SizedBox(height: 8),
-                                    _InfoRow(
+                                    if (frames?.batteryVoltage != null)
+                                      _InfoRow(
                                         label: 'Battery',
                                         value:
-                                            '${_calculateBatteryPercentage(frames!.batteryVoltage)}% (${frames.batteryVoltage} mV)'),
+                                            '${_calculateBatteryPercentage(frames!.batteryVoltage)}% (${frames.batteryVoltage} mV)',
+                                      ),
                                     _InfoRow(
-                                        label: 'Chip temperature',
-                                        value: '${frames.temperature?.toStringAsFixed(1)} °C'),
-                                    _InfoRow(label: 'ADV count', value: '${frames.advCount}'),
-                                    _InfoRow(label: 'Running time', value: _formatRunningTime(frames.runningTime)),
+                                      label: 'Chip temperature',
+                                      value: frames?.temperature == null
+                                          ? 'N/A'
+                                          : '${frames!.temperature!.toStringAsFixed(2)} °C',
+                                    ),
+                                    _InfoRow(label: 'ADV count', value: '${frames?.advCount ?? "N/A"}'),
+                                    _InfoRow(
+                                      label: 'Running time',
+                                      value: _formatRunningTime01s(frames?.runningTime01s),
+                                    ),
                                     const Divider(),
                                   ],
                                   if (frames?.accelX != null) ...[
-                                    const Text('3-axis accelerometer',
+                                    const Text('BeaconX 3-axis ACC',
                                         style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
                                     const SizedBox(height: 8),
-                                    _InfoRow(
+                                    if (frames?.batteryVoltage != null)
+                                      _InfoRow(
                                         label: 'Battery',
                                         value:
-                                            '${_calculateBatteryPercentage(frames?.batteryVoltage)}% (${frames?.batteryVoltage} mV)'),
+                                            '${_calculateBatteryPercentage(frames!.batteryVoltage)}% (${frames.batteryVoltage} mV)',
+                                      ),
                                     _InfoRow(
-                                        label: 'Acceleration',
-                                        value:
-                                            'X:${frames?.accelX!.toStringAsFixed(0)} mg, Y:${frames?.accelY!.toStringAsFixed(0)} mg, Z:${frames?.accelZ!.toStringAsFixed(0)} mg'),
+                                      label: 'Acceleration',
+                                      value:
+                                          'X:${frames!.accelX!.toStringAsFixed(0)} mg, Y:${frames.accelY!.toStringAsFixed(0)} mg, Z:${frames.accelZ!.toStringAsFixed(0)} mg',
+                                    ),
                                     if (frames?.samplingRate != null)
                                       _InfoRow(
-                                          label: 'Sampling rate',
-                                          value: '${_getSamplingRateHz(frames?.samplingRate)} Hz'),
+                                        label: 'Sampling rate',
+                                        value: '${_getSamplingRateHz(frames!.samplingRate)} Hz',
+                                      ),
                                     if (frames?.fullScale != null)
-                                      _InfoRow(label: 'Full-scale', value: '${_getFullScaleG(frames?.fullScale)}g'),
+                                      _InfoRow(label: 'Full-scale', value: '${_getFullScaleG(frames!.fullScale)}g'),
                                     if (frames?.motionThreshold != null)
-                                      _InfoRow(label: 'Motion threshold', value: '${frames?.motionThreshold}g'),
+                                      _InfoRow(label: 'Motion threshold', value: '${frames!.motionThreshold}g'),
                                     if (frames?.advInterval != null)
-                                      _InfoRow(label: 'Adv interval', value: '${frames?.advInterval} ms'),
+                                      _InfoRow(label: 'Adv interval', value: '${frames!.advInterval} ms'),
                                     if (frames?.rangingData != null)
-                                      _InfoRow(label: 'Ranging data', value: '${frames?.rangingData} dBm'),
+                                      _InfoRow(label: 'Ranging data', value: '${frames!.rangingData} dBm'),
                                     if (frames?.beaconMac != null)
-                                      _InfoRow(label: 'Beacon MAC', value: '${frames?.beaconMac}'),
+                                      _InfoRow(label: 'Beacon MAC', value: frames!.beaconMac!),
+                                    if (frames?.beaconMacReversed != null)
+                                      _InfoRow(label: 'Beacon MAC (rev)', value: frames!.beaconMacReversed!),
                                     const Divider(),
                                   ],
                                   _InfoRow(label: 'RSSI', value: '${frames?.rssi ?? result.rssi} dBm'),
@@ -339,14 +521,15 @@ class _ScanScreenState extends State<ScanScreen> {
     );
   }
 
-  String _formatRunningTime(int? seconds) {
-    if (seconds == null) return 'N/A';
-    final duration = Duration(milliseconds: seconds * 100);
+  String _formatRunningTime01s(int? time01s) {
+    if (time01s == null) return 'N/A';
+    final duration = Duration(milliseconds: time01s * 100); // 0.1s units => *100ms
     final days = duration.inDays;
     final hours = duration.inHours % 24;
     final minutes = duration.inMinutes % 60;
     final secs = duration.inSeconds % 60;
-    return '${days}d${hours}h${minutes}m${secs}.${(duration.inMilliseconds % 1000) ~/ 100}s';
+    final deci = (duration.inMilliseconds % 1000) ~/ 100;
+    return '${days}d${hours}h${minutes}m${secs}.${deci}s';
   }
 
   String _formatTime(DateTime? time) {
@@ -361,31 +544,33 @@ class _ScanScreenState extends State<ScanScreen> {
 
 class BeaconFrames {
   final String deviceId;
+
   int rssi = 0;
   DateTime lastSeen = DateTime.now();
 
-  // UID frame
+  // Eddystone UID frame
   String? namespaceId;
   String? instanceId;
 
-  // TLM frame
+  // Eddystone TLM frame
   int? batteryVoltage;
   double? temperature;
   int? advCount;
-  int? runningTime;
+  int? runningTime01s; // 0.1s units (per Eddystone)
 
-  // ACC frame
+  // BeaconX ACC frame
   double? accelX;
   double? accelY;
   double? accelZ;
 
-  // ACC frame additional fields (per BeaconX Table 9)
   int? rangingData;
   int? advInterval;
   int? samplingRate;
   int? fullScale;
   double? motionThreshold;
+
   String? beaconMac;
+  String? beaconMacReversed;
 
   // GATT connection state
   bool hasReadGattData = false;
