@@ -10,14 +10,14 @@ import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodChannel
-import android.bluetooth.BluetoothAdapter
-import android.bluetooth.BluetoothManager
-import android.bluetooth.le.BluetoothLeScanner
-import android.bluetooth.le.ScanCallback
-import android.bluetooth.le.ScanResult
-import android.bluetooth.le.ScanSettings
 import com.moko.support.nordic.MokoSupport
+import com.moko.support.nordic.MokoBleScanner
+import com.moko.support.nordic.callback.MokoScanDeviceCallback
 import com.moko.support.nordic.entity.OrderCHAR
+import com.moko.support.nordic.entity.DeviceInfo
+import com.moko.bxp.nordic.utils.BeaconXInfoParseableImpl
+import com.moko.bxp.nordic.utils.BeaconXParser
+import com.moko.bxp.nordic.entity.BeaconXInfo
 import com.moko.ble.lib.event.ConnectStatusEvent
 import com.moko.ble.lib.event.OrderTaskResponseEvent
 import org.greenrobot.eventbus.EventBus
@@ -31,19 +31,17 @@ class MainActivity: FlutterActivity() {
     private val EVENT_CHANNEL = "com.example.beacons_app/ble_scan"
     private val REQUEST_CODE_PERMISSIONS = 100
 
-    private var bluetoothLeScanner: BluetoothLeScanner? = null
+    private var mokoBleScanner: MokoBleScanner? = null
     private var eventSink: EventChannel.EventSink? = null
     private var isScanning = false
-    private val scanCallback = object : ScanCallback() {
-        override fun onScanResult(callbackType: Int, result: ScanResult) {
-            processScanResult(result)
-        }
-    }
     // MAC-based frame accumulation: last UID + last ACC per beacon
     private val beaconFrames = mutableMapOf<String, MutableMap<String, Any?>>()
     private var connectingMac: String? = null
     private val beaconPassword = "Moko4321"
     private var gattReadAttempted = false
+    private var lockStateChallenge: ByteArray? = null
+    // Single parser instance to accumulate frames across scan results
+    private val beaconXInfoParser = BeaconXInfoParseableImpl()
 
     override fun onCreate(savedInstanceState: android.os.Bundle?) {
         super.onCreate(savedInstanceState)
@@ -82,6 +80,17 @@ class MainActivity: FlutterActivity() {
                     connectingMac = "D7:4F:4C:D2:4F:3B"
                     triggerGattRead()
                     result.success(true)
+                }
+                "readUidGatt" -> {
+                    val mac = call.argument<String>("mac")
+                    if (mac != null) {
+                        android.util.Log.d("BeaconX-GATT", "GATT UID read requested for $mac")
+                        connectingMac = mac
+                        triggerGattRead()
+                        result.success(true)
+                    } else {
+                        result.error("INVALID_MAC", "MAC address required", null)
+                    }
                 }
                 else -> result.notImplemented()
             }
@@ -142,66 +151,53 @@ class MainActivity: FlutterActivity() {
     private fun startScan() {
         if (isScanning) return
         
-        val bluetoothManager = getSystemService(BLUETOOTH_SERVICE) as BluetoothManager
-        val bluetoothAdapter = bluetoothManager.adapter
-        bluetoothLeScanner = bluetoothAdapter.bluetoothLeScanner
-        
-        // Pure Android BLE scanner with aggressive settings
-        val settings = ScanSettings.Builder()
-            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
-            .setLegacy(true)
-            .setMatchMode(ScanSettings.MATCH_MODE_AGGRESSIVE)
-            .setNumOfMatches(ScanSettings.MATCH_NUM_MAX_ADVERTISEMENT)
-            .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
-            .setReportDelay(0)
-            .build()
-        
-        bluetoothLeScanner?.startScan(null, settings, scanCallback) // No filter!
-        isScanning = true
-        android.util.Log.d("BeaconX-PURE", "Pure Android BLE scan started")
+        // Use MokoBleScanner (Nordic library) for proper ScanResult type
+        mokoBleScanner = MokoBleScanner(this)
+        mokoBleScanner?.startScanDevice(object : MokoScanDeviceCallback {
+            override fun onStartScan() {
+                isScanning = true
+                android.util.Log.d("BeaconX-SDK", "MokoBleScanner started")
+            }
+            
+            override fun onScanDevice(deviceInfo: DeviceInfo) {
+                processDeviceInfo(deviceInfo)
+            }
+            
+            override fun onStopScan() {
+                isScanning = false
+                android.util.Log.d("BeaconX-SDK", "MokoBleScanner stopped")
+            }
+        })
     }
     
-    private fun processScanResult(result: ScanResult) {
+    private fun processDeviceInfo(deviceInfo: DeviceInfo) {
         try {
-            val device = result.device
-            val mac = device.address
+            val mac = deviceInfo.mac
+            val rssi = deviceInfo.rssi
+            val name = deviceInfo.name ?: ""
             
-            // Filter: only process these 2 specific beacons
-            if (mac != "D7:4F:4C:D2:4F:3B" && mac != "ED:CF:19:48:B0:D5") {
+            // === BeaconX SDK 2-step parsing approach ===
+            // DeviceInfo already has scanResult from MokoBleScanner
+            // Use shared parser instance to accumulate frames across advertisements
+            
+            val beaconXInfo = beaconXInfoParser.parseDeviceInfo(deviceInfo)
+            if (beaconXInfo == null) {
+                // Not a BeaconX Pro device, skip
                 return
             }
             
-            val scanRecord = result.scanRecord ?: return
-            val rawBytes = scanRecord.bytes ?: return
-            val rssi = result.rssi
-            val name = scanRecord.deviceName ?: ""
+            android.util.Log.d("BeaconX-SDK", "[$mac] BeaconX Pro detected!")
             
-            // Parse for FEAA/FEAB
-            var logPos = 0
-            var foundFEAA = false
-            var foundFEAB = false
-            while (logPos < rawBytes.size) {
-                val length = rawBytes[logPos].toInt() and 0xFF
-                if (length == 0) break
-                if (logPos + 1 + length > rawBytes.size) break
-                
-                val type = rawBytes[logPos + 1].toInt() and 0xFF
-                if (type == 0x16) {
-                    val data = rawBytes.sliceArray((logPos + 2) until (logPos + 1 + length))
-                    if (data.size >= 2) {
-                        val uuid16 = ((data[1].toInt() and 0xFF) shl 8) or (data[0].toInt() and 0xFF)
-                        if (uuid16 == 0xFEAA) {
-                            foundFEAA = true
-                        } else if (uuid16 == 0xFEAB) {
-                            foundFEAB = true
-                        }
-                    }
-                }
-                logPos += 1 + length
+            // Auto-trigger GATT read for new BeaconX beacons to get namespace ID
+            val existingFrames = beaconFrames[mac]
+            val hasNamespace = existingFrames?.containsKey("uid") == true
+            if (!hasNamespace && connectingMac == null) {
+                android.util.Log.d("BeaconX-SDK", "[$mac] New BeaconX beacon, triggering GATT read for namespace...")
+                connectingMac = mac
+                MokoSupport.getInstance().connDevice(mac)
             }
             
-            // Log detected service UUIDs
-            android.util.Log.d("BeaconX-PURE", "[$mac] FEAA=$foundFEAA, FEAB=$foundFEAB")
+            android.util.Log.d("BeaconX-SDK", "[$mac] Parsed BeaconXInfo, validDataHashMap size=${beaconXInfo.validDataHashMap?.size ?: 0}")
             
             // Initialize frame cache for this MAC if needed
             if (!beaconFrames.containsKey(mac)) {
@@ -215,100 +211,91 @@ class MainActivity: FlutterActivity() {
             val frames = beaconFrames[mac]!!
             frames["rssi"] = rssi
             
-            // Parse raw bytes for FEAA/FEAB alternation
-            var pos = 0
-            while (pos < rawBytes.size) {
-                val length = rawBytes[pos].toInt() and 0xFF
-                if (length == 0) break
-                if (pos + 1 + length > rawBytes.size) break
+            // Step 2: Extract and parse frame data
+            beaconXInfo.validDataHashMap?.values?.forEach { validData ->
+                android.util.Log.d("BeaconX-SDK", "[$mac] Frame type=0x${Integer.toHexString(validData.type)}, data=${validData.data}")
                 
-                val type = rawBytes[pos + 1].toInt() and 0xFF
-                val adData = rawBytes.sliceArray((pos + 2) until (pos + 1 + length))
-                
-                // Type 0x16 = Service Data (16-bit UUID)
-                if (type == 0x16 && adData.size >= 2) {
-                    val uuidLow = adData[0].toInt() and 0xFF
-                    val uuidHigh = adData[1].toInt() and 0xFF
-                    val uuid16 = (uuidHigh shl 8) or uuidLow
-                    val payload = adData.sliceArray(2 until adData.size)
-                    
-                    when (uuid16) {
-                        0xFEAA -> {
-                            android.util.Log.d("BeaconX-PURE", "[$mac] 📡 FEAA frame detected, payload size=${payload.size}, frameType=0x${payload.getOrNull(0)?.let { "%02x".format(it) }}")
-                            // Eddystone UID (frame type 0x00) - 18 bytes total
-                            if (payload.size >= 18 && payload[0].toInt() and 0xFF == 0x00) {
-                                val txPower = payload[1].toInt()
-                                val namespace = payload.sliceArray(2..11).joinToString("") { "%02X".format(it) }
-                                val instance = payload.sliceArray(12..17).joinToString("") { "%02X".format(it) }
-                                
-                                // Store last UID for this MAC
-                                frames["uid"] = mapOf(
-                                    "namespace" to namespace,
-                                    "instance" to instance,
-                                    "rangingData" to txPower
-                                )
-                                android.util.Log.d("BeaconX-PURE", "[$mac] ✅ UID: namespace=$namespace, instance=$instance")
-                            }
-                        }
-                        0xFEAB -> {
-                            // BeaconX ACC (frame type 0x60)
-                            if (payload.size >= 18 && payload[0].toInt() and 0xFF == 0x60) {
-                                val rate = payload[2].toInt() and 0xFF
-                                val scale = payload[3].toInt() and 0xFF
-                                val sensitivity = payload[4].toInt() and 0xFF
-                                
-                                // X axis (2 bytes, little-endian, signed)
-                                val xRaw = ((payload[6].toInt() and 0xFF) shl 8) or (payload[5].toInt() and 0xFF)
-                                val x = if (xRaw > 32767) xRaw - 65536 else xRaw
-                                
-                                // Y axis
-                                val yRaw = ((payload[8].toInt() and 0xFF) shl 8) or (payload[7].toInt() and 0xFF)
-                                val y = if (yRaw > 32767) yRaw - 65536 else yRaw
-                                
-                                // Z axis
-                                val zRaw = ((payload[10].toInt() and 0xFF) shl 8) or (payload[9].toInt() and 0xFF)
-                                val z = if (zRaw > 32767) zRaw - 65536 else zRaw
-                                
-                                val scaleValue = when(scale) {
-                                    0 -> 2
-                                    1 -> 4
-                                    2 -> 8
-                                    3 -> 16
-                                    else -> 2
-                                }
-                                
-                                // Store last ACC for this MAC
-                                frames["acc"] = mapOf(
-                                    "x_data" to x.toString(),
-                                    "y_data" to y.toString(),
-                                    "z_data" to z.toString(),
-                                    "rangingData" to "0",
-                                    "dataRate" to rate.toString(),
-                                    "scale" to scaleValue.toString(),
-                                    "sensitivity" to sensitivity.toString()
-                                )
-                                android.util.Log.d("BeaconX-PURE", "[$mac] ✅ ACC: x=$x, y=$y, z=$z")
-                            }
-                        }
+                when (validData.type) {
+                    BeaconXInfo.VALID_DATA_FRAME_TYPE_UID -> {
+                        // Parse UID frame
+                        val uid = BeaconXParser.getUID(validData.data)
+                        frames["uid"] = mapOf(
+                            "namespace" to uid.namespace,
+                            "instance" to uid.instanceId,
+                            "rangingData" to uid.rangingData
+                        )
+                        android.util.Log.d("BeaconX-SDK", "[$mac] ✅ UID: namespace=${uid.namespace}, instance=${uid.instanceId}")
+                    }
+                    BeaconXInfo.VALID_DATA_FRAME_TYPE_TLM -> {
+                        // Parse TLM frame
+                        val tlm = BeaconXParser.getTLM(validData.data)
+                        frames["tlm"] = mapOf(
+                            "vbatt" to tlm.vbatt,
+                            "temp" to tlm.temp,
+                            "adv_cnt" to tlm.adv_cnt
+                        )
+                        android.util.Log.d("BeaconX-SDK", "[$mac] 📊 TLM: battery=${tlm.vbatt}mV, temp=${tlm.temp}")
+                    }
+                    BeaconXInfo.VALID_DATA_FRAME_TYPE_AXIS -> {
+                        // Parse ACC frame
+                        val axis = BeaconXParser.getAxis(beaconXInfo.needParseData, validData.data)
+                        frames["acc"] = mapOf(
+                            "x_data" to axis.x_data,
+                            "y_data" to axis.y_data,
+                            "z_data" to axis.z_data,
+                            "rangingData" to axis.rangingData,
+                            "dataRate" to axis.dataRate,
+                            "scale" to axis.scale,
+                            "sensitivity" to axis.sensitivity,
+                            "battery" to beaconXInfo.battery
+                        )
+                        android.util.Log.d("BeaconX-SDK", "[$mac] ✅ ACC: x=${axis.x_data}mg, y=${axis.y_data}mg, z=${axis.z_data}mg, battery=${beaconXInfo.battery}mV")
+                    }
+                    BeaconXInfo.VALID_DATA_FRAME_TYPE_TH -> {
+                        // Parse T&H frame
+                        val th = BeaconXParser.getTH(validData.data)
+                        frames["th"] = mapOf(
+                            "temperature" to th.temperature,
+                            "humidity" to th.humidity,
+                            "rangingData" to th.rangingData
+                        )
+                        android.util.Log.d("BeaconX-SDK", "[$mac] 🌡️ T&H: temp=${th.temperature}°C, humidity=${th.humidity}%")
                     }
                 }
-                
-                pos += 1 + length
             }
             
-            // Send accumulated frames (last UID + last ACC) to Flutter
+            // Send accumulated frames to Flutter
             eventSink?.success(frames.toMap())
         } catch (e: Exception) {
-            android.util.Log.e("BeaconX-PURE", "Error processing scan result: ${e.message}")
+            android.util.Log.e("BeaconX-SDK", "Error processing scan result: ${e.message}")
             e.printStackTrace()
         }
     }
 
     private fun stopScan() {
         if (!isScanning) return
-        bluetoothLeScanner?.stopScan(scanCallback)
+        mokoBleScanner?.stopScanDevice()
+        mokoBleScanner = null
         isScanning = false
-        android.util.Log.d("BeaconX-PURE", "Pure Android BLE scan stopped")
+        android.util.Log.d("BeaconX-SDK", "MokoBleScanner stopped")
+    }
+    
+    private fun tryConnectNextBeacon() {
+        if (connectingMac != null) return
+        
+        // Find a beacon that doesn't have namespace yet
+        val beaconWithoutNamespace = beaconFrames.entries.firstOrNull { (_, frames) ->
+            !frames.containsKey("uid")
+        }
+        
+        if (beaconWithoutNamespace != null) {
+            val mac = beaconWithoutNamespace.key
+            android.util.Log.d("BeaconX-SDK", "[$mac] Found beacon without namespace, triggering GATT read...")
+            connectingMac = mac
+            MokoSupport.getInstance().connDevice(mac)
+        } else {
+            android.util.Log.d("BeaconX-SDK", "All beacons have namespace, no more GATT reads needed")
+        }
     }
 
     private fun triggerGattRead() {
@@ -323,18 +310,21 @@ class MainActivity: FlutterActivity() {
         
         when (event.action) {
             "ACTION_DISCOVER_SUCCESS" -> {
-                android.util.Log.d("BeaconX-GATT", "Connected! Sending unlock...")
-                val unlockTask = com.moko.support.nordic.OrderTaskAssembler.setUnLock(
-                    beaconPassword,
-                    byteArrayOf(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
-                )
-                if (unlockTask != null) {
-                    MokoSupport.getInstance().sendOrder(unlockTask)
-                }
+                android.util.Log.d("BeaconX-GATT", "Connected! Getting unlock challenge first (like official app)...")
+                // Step 1: Read CHAR_UNLOCK to get the 16-byte challenge
+                android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                    val getUnlockTask = com.moko.support.nordic.OrderTaskAssembler.getUnLock()
+                    MokoSupport.getInstance().sendOrder(getUnlockTask)
+                }, 500)
             }
             "ACTION_DISCONNECTED" -> {
                 android.util.Log.d("BeaconX-GATT", "Disconnected")
                 connectingMac = null
+                
+                // Check if there are other beacons that need namespace reading
+                android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                    tryConnectNextBeacon()
+                }, 1000)
             }
         }
     }
@@ -348,49 +338,137 @@ class MainActivity: FlutterActivity() {
         
         when (response.orderCHAR) {
             OrderCHAR.CHAR_UNLOCK -> {
-                android.util.Log.d("BeaconX-GATT", "✅ Unlocked! Reading Active Slot (a3c87502)...")
-                // READ Active Slot first (no assembler method exists, create task directly)
-                val getActiveSlotTask = com.moko.support.nordic.task.GetAdvSlotTask()
-                MokoSupport.getInstance().sendOrder(getActiveSlotTask)
-            }
-            OrderCHAR.CHAR_ADV_SLOT -> {
-                val data = response.responseValue ?: return
-                android.util.Log.d("BeaconX-GATT", "📊 Active Slot (a3c87502): ${data.joinToString("") { "%02x".format(it) }}")
+                val data = response.responseValue
+                android.util.Log.d("BeaconX-GATT", "🔐 CHAR_UNLOCK response: ${data?.joinToString("") { "%02x".format(it) }}")
                 
-                // Now READ ADV Slot Data (a3c8750a)
-                android.util.Log.d("BeaconX-GATT", "Reading ADV Slot Data (a3c8750a)...")
+                if (response.responseType == com.moko.ble.lib.task.OrderTask.RESPONSE_TYPE_READ) {
+                    // Step 2: Got challenge, now send unlock with password
+                    if (data != null && data.isNotEmpty()) {
+                        android.util.Log.d("BeaconX-GATT", "Got challenge, sending unlock with password...")
+                        val unlockTask = com.moko.support.nordic.OrderTaskAssembler.setUnLock(beaconPassword, data)
+                        if (unlockTask != null) {
+                            MokoSupport.getInstance().sendOrder(unlockTask)
+                        }
+                    }
+                } else if (response.responseType == com.moko.ble.lib.task.OrderTask.RESPONSE_TYPE_WRITE) {
+                    // Step 3: Unlock written, now verify by reading lock state
+                    android.util.Log.d("BeaconX-GATT", "Unlock sent, verifying lock state...")
+                    val getLockStateTask = com.moko.support.nordic.OrderTaskAssembler.getLockState()
+                    MokoSupport.getInstance().sendOrder(getLockStateTask)
+                }
+            }
+            OrderCHAR.CHAR_LOCK_STATE -> {
+                val data = response.responseValue
+                val lockState = if (data != null && data.isNotEmpty()) data[0].toInt() and 0xFF else -1
+                android.util.Log.d("BeaconX-GATT", "🔓 Lock state: ${data?.joinToString("") { "%02x".format(it) }} (${if (lockState == 0) "LOCKED" else if (lockState == 2) "NO_PASSWORD" else "UNLOCKED"})")
+                
+                // Step 4: Now unlocked, read device type then slot types
+                if (lockState != 0) {
+                    android.util.Log.d("BeaconX-GATT", "✅ Unlocked! Now reading device type...")
+                    val getDeviceTypeTask = com.moko.support.nordic.OrderTaskAssembler.getDeviceType()
+                    MokoSupport.getInstance().sendOrder(getDeviceTypeTask)
+                } else {
+                    android.util.Log.d("BeaconX-GATT", "❌ Still locked! Password may be wrong.")
+                    MokoSupport.getInstance().disConnectBle()
+                    connectingMac = null
+                }
+            }
+            OrderCHAR.CHAR_DEVICE_TYPE -> {
+                val data = response.responseValue
+                android.util.Log.d("BeaconX-GATT", "📱 Device type: ${data?.joinToString("") { "%02x".format(it) }}")
+                
+                // Step 5: Now read slot types
+                android.util.Log.d("BeaconX-GATT", "Reading slot types...")
+                val getSlotTypeTask = com.moko.support.nordic.OrderTaskAssembler.getSlotType()
+                MokoSupport.getInstance().sendOrder(getSlotTypeTask)
+            }
+            OrderCHAR.CHAR_SLOT_TYPE -> {
+                val data = response.responseValue ?: return
+                android.util.Log.d("BeaconX-GATT", "📊 Slot types: ${data.joinToString("") { "%02x".format(it) }}")
+                
+                // Parse slot types: value[0]=SLOT1, value[1]=SLOT2, etc.
+                // Type 0x00 = UID, 0x10 = URL, 0x20 = TLM, 0x50 = iBeacon, 0x60 = ACC, 0x70 = T&H
+                for (i in data.indices) {
+                    val slotType = data[i].toInt() and 0xFF
+                    android.util.Log.d("BeaconX-GATT", "  Slot ${i + 1}: type=0x${slotType.toString(16)}")
+                    
+                    if (slotType == 0x00) {
+                        android.util.Log.d("BeaconX-GATT", "  → Slot ${i + 1} is UID!")
+                    }
+                }
+                
+                // Now read the slot data for slot 1 (default active slot)
+                android.util.Log.d("BeaconX-GATT", "Reading slot data...")
                 val getSlotDataTask = com.moko.support.nordic.OrderTaskAssembler.getSlotData()
                 MokoSupport.getInstance().sendOrder(getSlotDataTask)
             }
             OrderCHAR.CHAR_ADV_SLOT_DATA -> {
                 val data = response.responseValue ?: return
-                android.util.Log.d("BeaconX-GATT", "📊 ADV Slot Data (a3c8750a): ${data.joinToString("") { "%02x".format(it) }}")
+                android.util.Log.d("BeaconX-GATT", "📊 Slot data: ${data.joinToString("") { "%02x".format(it) }}")
                 
-                // Parse UID from slot data
-                parseSlotData(mac, data)
+                // Parse slot data (check if UID)
+                val foundUid = parseSlotData(mac, data)
                 
-                // Disconnect after successful read
-                android.util.Log.d("BeaconX-GATT", "✅ UID read complete. Disconnecting...")
+                android.util.Log.d("BeaconX-GATT", "Slot data parsed, foundUid=$foundUid. Disconnecting...")
+                MokoSupport.getInstance().disConnectBle()
+                connectingMac = null
+            }
+            OrderCHAR.CHAR_PARAMS -> {
+                val data = response.responseValue
+                android.util.Log.d("BeaconX-GATT", "📊 CHAR_PARAMS response: ${data?.joinToString("") { "%02x".format(it) }}")
+                
+                // CHAR_PARAMS works! Parse the response
+                // Format: EB [cmd] 00 [len] [data...]
+                // cmd 0x20 = device MAC, cmd 0x21 = axis params
+                if (data != null && data.size >= 4) {
+                    val cmd = data[1].toInt() and 0xFF
+                    val len = data[3].toInt() and 0xFF
+                    
+                    when (cmd) {
+                        0x20 -> {
+                            // Device MAC response
+                            if (data.size >= 4 + len) {
+                                val macBytes = data.copyOfRange(4, 4 + len)
+                                val macStr = macBytes.joinToString(":") { "%02X".format(it) }
+                                android.util.Log.d("BeaconX-GATT", "✅ Device MAC: $macStr")
+                            }
+                        }
+                        0x21 -> {
+                            // Axis params response
+                            android.util.Log.d("BeaconX-GATT", "✅ Axis params received")
+                        }
+                    }
+                }
+                
+                // Disconnect after getting response
+                android.util.Log.d("BeaconX-GATT", "GATT communication verified. Disconnecting...")
                 MokoSupport.getInstance().disConnectBle()
                 connectingMac = null
             }
             else -> {
-                android.util.Log.d("BeaconX-GATT", "Unhandled characteristic: ${response.orderCHAR}")
+                android.util.Log.d("BeaconX-GATT", "Unhandled characteristic: ${response.orderCHAR}, data=${response.responseValue?.joinToString("") { "%02x".format(it) }}")
+                
+                // If we got any response, disconnect after logging
+                if (response.responseValue != null) {
+                    android.util.Log.d("BeaconX-GATT", "Got response, disconnecting...")
+                    MokoSupport.getInstance().disConnectBle()
+                    connectingMac = null
+                }
             }
         }
     }
 
-    private fun parseSlotData(mac: String, data: ByteArray) {
-        if (data.size < 3) return
+    private fun parseSlotData(mac: String, data: ByteArray): Boolean {
+        if (data.size < 2) return false
         
-        val frameType = data[1].toInt() and 0xFF
+        val frameType = data[0].toInt() and 0xFF
         android.util.Log.d("BeaconX-GATT", "Slot data frame type: 0x${frameType.toString(16)}")
         
-        // Frame type 0x00 = UID
-        if (frameType == 0x00 && data.size >= 22) {
-            val txPower = data[2].toInt()
-            val namespace = data.copyOfRange(3, 13).joinToString("") { "%02X".format(it) }
-            val instance = data.copyOfRange(13, 19).joinToString("") { "%02X".format(it) }
+        // Frame type 0x00 = UID (Eddystone UID frame)
+        if (frameType == 0x00 && data.size >= 18) {
+            val txPower = data[1].toInt()
+            val namespace = data.copyOfRange(2, 12).joinToString("") { "%02X".format(it) }
+            val instance = data.copyOfRange(12, 18).joinToString("") { "%02X".format(it) }
             
             android.util.Log.d("BeaconX-GATT", "✅ UID via GATT: namespace=$namespace, instance=$instance")
             
@@ -406,11 +484,9 @@ class MainActivity: FlutterActivity() {
             
             // Send updated data to Flutter
             eventSink?.success(beaconFrames[mac]!!.toMap())
-            
-            // Disconnect after reading
-            MokoSupport.getInstance().disConnectBle()
-            connectingMac = null
+            return true
         }
+        return false
     }
 
 }

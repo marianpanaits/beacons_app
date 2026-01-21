@@ -33,11 +33,20 @@ class _ScanScreenState extends State<ScanScreen> {
   static const platform = MethodChannel('com.example.beacons_app/ble');
   static const eventChannel = EventChannel('com.example.beacons_app/ble_scan');
   static const Set<String> _serviceUuids = {'feab', 'feaa'};
+  
+  // Target namespace ID to filter beacons
+  static const String _targetNamespaceId = '60657774606074726163';
 
   final Map<String, NativeScanResult> _scanResults = {};
   final Map<String, BeaconFrames> _beaconFrames = {};
   bool _isScanning = false;
   StreamSubscription? _scanSubscription;
+
+  // Get devices filtered by target namespace ID
+  List<String> get _filteredDevices => _beaconFrames.entries
+      .where((e) => e.value.namespaceId == _targetNamespaceId)
+      .map((e) => e.key)
+      .toList();
 
   @override
   void initState() {
@@ -105,8 +114,12 @@ class _ScanScreenState extends State<ScanScreen> {
           frames.accelX = double.tryParse(acc['x_data'] as String? ?? '');
           frames.accelY = double.tryParse(acc['y_data'] as String? ?? '');
           frames.accelZ = double.tryParse(acc['z_data'] as String? ?? '');
-          debugPrint('📐 ACC: X=${frames.accelX}mg, Y=${frames.accelY}mg, Z=${frames.accelZ}mg');
-          debugPrint('    Rate: ${acc['dataRate']}, Scale: ${acc['scale']}, Sensitivity: ${acc['sensitivity']}');
+          // Battery comes as int from ACC frame
+          final batteryVal = acc['battery'];
+          if (batteryVal != null) {
+            frames.batteryVoltage = batteryVal is int ? batteryVal : int.tryParse(batteryVal.toString());
+          }
+          debugPrint('📐 ACC: X=${frames.accelX}mg, Y=${frames.accelY}mg, Z=${frames.accelZ}mg, Battery=${frames.batteryVoltage}mV');
         }
 
         if (scanData.containsKey('th')) {
@@ -181,7 +194,6 @@ class _ScanScreenState extends State<ScanScreen> {
     }
   }
 
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -193,12 +205,12 @@ class _ScanScreenState extends State<ScanScreen> {
         children: [
           if (_isScanning) const LinearProgressIndicator(),
           Expanded(
-            child: _scanResults.isEmpty
+            child: _filteredDevices.isEmpty
                 ? const Center(child: Text('Scanning for beacons...'))
                 : ListView.builder(
-                    itemCount: _scanResults.length,
+                    itemCount: _filteredDevices.length,
                     itemBuilder: (context, index) {
-                      final deviceId = _scanResults.keys.elementAt(index);
+                      final deviceId = _filteredDevices[index];
                       final result = _scanResults[deviceId]!;
                       final frames = _beaconFrames[deviceId];
 
