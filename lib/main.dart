@@ -71,6 +71,13 @@ class _ScanScreenState extends State<ScanScreen> {
             final deviceId = result.device.remoteId.toString();
             _beaconFrames[deviceId] ??= BeaconFrames(deviceId);
 
+            final ad = result.advertisementData;
+
+            debugPrint('--- ${result.device.remoteId} RSSI=${result.rssi}');
+            debugPrint('serviceUuids: ${ad.serviceUuids.map((g) => g.str).toList()}');
+            debugPrint('serviceData keys: ${ad.serviceData.keys.map((g) => g.str).toList()}');
+            debugPrint('manufacturerData keys: ${ad.manufacturerData.keys.toList()}');
+
             for (final entry in result.advertisementData.serviceData.entries) {
               if (entry.key.toString().toLowerCase().contains(_beaconServiceUuid)) {
                 _parseFrame(deviceId, entry.value, result.rssi);
@@ -137,9 +144,9 @@ class _ScanScreenState extends State<ScanScreen> {
           final zRaw = (data[10] << 8) | data[11];
           frames.batteryVoltage = (data[12] << 8) | data[13];
 
-          frames.accelX = _calculate12BitAccel(xRaw);
-          frames.accelY = _calculate12BitAccel(yRaw);
-          frames.accelZ = _calculate12BitAccel(zRaw);
+          frames.accelX = _decode12BitSignedMg(xRaw);
+          frames.accelY = _decode12BitSignedMg(yRaw);
+          frames.accelZ = _decode12BitSignedMg(zRaw);
 
           // Parse MAC address (bytes 15-20)
           if (data.length >= 21) {
@@ -161,12 +168,10 @@ class _ScanScreenState extends State<ScanScreen> {
     }
   }
 
-  double _calculate12BitAccel(int raw) {
-    // BeaconX Doc: 12-bit output with full-scale ±2g (1 mg/digit)
-    // If raw < 0x8000: Result=(RAW>>4)*1 mg
-    // If raw >= 0x8000: Result=((RAW>>4)-0x1000)*1 mg
-    int shifted = raw < 0x8000 ? raw >> 4 : (raw >> 4) - 0x1000;
-    return shifted.toDouble(); // Return in mg (milligrams)
+  double _decode12BitSignedMg(int raw16) {
+    final v12 = (raw16 >> 4) & 0x0FFF;
+    final signed = (v12 & 0x800) != 0 ? v12 - 0x1000 : v12;
+    return signed.toDouble();
   }
 
   int _calculateBatteryPercentage(int? voltage) {
@@ -215,9 +220,9 @@ class _ScanScreenState extends State<ScanScreen> {
   }
 
   bool _isBeacon(ScanResult result) {
-    return result.advertisementData.serviceData.keys.any(
-      (uuid) => uuid.toString().toLowerCase().contains(_beaconServiceUuid),
-    );
+    // Filter to show only target beacons
+    final mac = result.device.remoteId.toString().toUpperCase();
+    return mac == 'D7:4F:4C:D2:4F:3B' || mac == 'ED:CF:19:48:B0:D5';
   }
 
   @override
