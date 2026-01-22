@@ -258,7 +258,15 @@ class BeaconCard extends StatelessWidget {
 
   const BeaconCard({super.key, required this.beacon});
 
-  int _batteryPercent(int? mV) => mV == null ? 0 : ((mV - 2800) / 1400 * 100).round().clamp(0, 100);
+  int _batteryPercent(int? mV) {
+    if (mV == null) return 0;
+
+    const int maxMv = 3000; // CR2477 fresh
+    const int minMv = 2200; // cutoff
+
+    final percent = ((mV - minMv) * 100 / (maxMv - minMv));
+    return percent.round().clamp(0, 100);
+  }
 
   String _timeAgo(DateTime? t) {
     if (t == null) return 'N/A';
